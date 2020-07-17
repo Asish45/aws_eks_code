@@ -1,0 +1,348 @@
+Kubernetes is an open-source system for automating deployment, scaling, and management of containerized applications. 
+It is used for orchestration.
+
+Amazon provides EKS for hosting the Kubernetes cluster.
+EKS is a managed containers-as-a-service (CaaS). 
+EKS runs Kubernetes without installing and operating a Kubernetes control panel or worker nodes. 
+EKS creates master and slave nodes and set up entire Kubernetes cluster.
+
+Objectioves of Task:
+ # How to create EKS Cluster on Fargate- Server less Setup
+ # How to create EKS Cluster 
+ # How to deploy multi-tier architecture on top of this cluster
+
+To have connection to Amazon EKS, we have different ways as such WebUI, CLI, Terraform.
+So we need to install eksctl tool. eksctl contacts amazon EKS and behind the scenes EKS contacts AWS EC2 for launching instances(nodes) .
+For creating worker nodes we'll write program in YAML file format. This type of file have .yml extension
+
+1. 	Creating Farget cluster on aws eks
+------------------------------------------------------------------
+# Cluster
+
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfigmetadata:
+  name: mycluster
+  region: ap-south-1
+
+  nodeGroups:
+   - name: nodeGroup1
+     desiredCapacity: 2
+     instanceType: t2.micro
+     ssh:
+        publicKeyName: keyforeks
+   - name: ng-mixed
+     minSize: 1
+     maxSize: 3
+     instancesDistribution:
+       maxPrice: 0.010
+       instanceTypes: ["t2.micro"]
+       onDemandBaseCapacity: 0
+       onDemandPercentageAboveBaseCapacity: 50
+       spotInstancePools: 2     
+     ssh:
+         publicKeyName: keyforeks
+------------------------------------------------------------------
+Save the above yml code with name "eks-cluster.yml" (without quotation mark).
+
+
+> eksctl create -f eks-cluster.yml
+Above command will create an entire cluster with master & slave node in aws eks having 2 node groups and one spot instance for a node in given region (Mumbai).
+
+Now CLuster is ready. One can check through AWS WebUI whether cluster is created or not.
+
+
+2.	Creating Elastic File System
+Now we need to have a centralized storage in order to have the service within and across different Availability Zones. So we'll use Amazon EFS (Elastic File System).
+
+Just create EFS manually from this ( https://ap-south-1.console.aws.amazon.com/efs/home?region=ap-south-1#/filesystems ) Amazon EFS WebUI.
+
+3.	Launching EFS-PROVISIONER, STORAGE, RBAC
+
+EFS-PROVISIONER: The efs-provisioner allows us to mount EFS storage as PersistentVolumes in kubernetes. It consists of a container that has access to an AWS EFS resource. The container reads a ConfigMap containing the File system ID, Amazon Region of the EFS file system, and the name of the provisioner.
+
+STORAGE-CLASS resource determines which volume plugin is used for provisioning a PersistentVolume(PV).
+
+RBAC is role based access control.This provides roles or permissions .
+
+
+------------------------------------------------------------------
+# EFS-PROVISONER
+
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: efs-provisioner
+spec:
+  selector:
+    matchLabels:
+      app: efs-provisioner
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: efs-provisioner
+    spec:
+      containers:
+        - name: efs-provisioner
+          image: quay.io/external_storage/efs-provisioner:v0.1.0
+          env:
+            - name: FILE_SYSTEM_ID
+              value: fs-3025afe1
+            - name: AWS_REGION
+              value: ap-south-1
+            - name: PROVISIONER_NAME
+              value: lw-course/aws-efs
+          volumeMounts:
+            - name: pv-volume
+              mountPath: /persistentvolumes
+      volumes:
+        - name: pv-volume
+          nfs:
+            server: fs-3025afe1.efs.ap-south-1.amazonaws.com
+            path: /
+------------------------------------------------------------------
+Save the above yml code with name "efs-provisoioner.yml" (without quotation mark).
+
+
+------------------------------------------------------------------
+# STORAGE-CLASS
+
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: aws-efs
+provisioner: lw-course/aws-efs
+
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: efs-wp
+  annotations:
+    volume.beta.kubernetes.io/storage-class: "aws-efs"
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: efs-mysql-db
+  annotations:
+    volume.beta.kubernetes.io/storage-class: "aws-efs"
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+------------------------------------------------------------------
+Save the above yml code with name "storage.yml" (without quotation mark).
+
+
+------------------------------------------------------------------
+# RBAC
+
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: nfs-roles
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: lwns
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+------------------------------------------------------------------
+Save the above yml code with name "rbac.yml" (without quotation mark).
+
+Note: Necessary installation in the nodes Before moving further we need to install some program inside the nodes for having support for EFS. This software is amazon-efs-utils. So we need to install it in every node using yum install amazon-efs-utils.
+
+Login into our ec2 instances and run command:
+# sudo yum install amazon-efs-utils -y
+
+
+4. 	Deploying WordPress as well as MySQL
+------------------------------------------------------------------
+# wordpress deployment
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  labels:
+    app: wordpress
+spec:
+  ports:
+    - port: 80
+  selector:
+    app: wordpress
+    tier: frontend
+  type: LoadBalancer
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wp-pv-claim
+  labels:
+    app: wordpress
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+apiVersion: apps/v1 
+kind: Deployment
+metadata:
+  name: wordpress
+  labels:
+    app: wordpress
+spec:
+  selector:
+    matchLabels:
+      app: wordpress
+      tier: frontend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: wordpress
+        tier: frontend
+    spec:
+      containers:
+      - image: wordpress:4.8-apache
+        name: wordpress
+        env:
+        - name: WORDPRESS_HOST
+          value: wordpress-mysql 
+        - name: WORDPRESS_PASSWD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-passwd
+              key: password
+        ports:
+        - containerPort: 80
+          name: wordpress
+        volumeMounts:
+        - name: wordpress-persistent-storage
+          mountPath: /var/www/html
+      volumes:
+      - name: wordpress-persistent-storage
+        persistentVolumeClaim:
+          claimName: wp-pv-claim
+
+
+# mysql deployment
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql_db
+  labels:
+    app: wordpress
+spec:
+  ports:
+    - port: 3306
+  selector:
+    app: wordpress
+    tier: mysql
+  clusterIP: None
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pv
+  labels:
+    app: wordpress
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql_db
+  labels:
+    app: wordpress
+spec:
+  selector:
+    matchLabels:
+      app: wordpress
+      tier: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: wordpress
+        tier: mysql
+    spec:
+      containers:
+      - image: mysql:5.6
+        name: mysql
+        env:
+        - name: MYSQL_PASSWD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-passwd
+              key: password
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql_pv_storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql_pv_storage
+        persistentVolumeClaim:
+          claimName: mysql-pv
+------------------------------------------------------------------
+Save the above yml code with name "wp-mysql.yml" (without quotation mark).
+
+
+5.	Kustomization
+------------------------------------------------------------------
+# kustomization file
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+secretGenerator:
+- name: mysql-passwd
+  literals:
+   - password=root
+resources:
+  -  efs-provisoioner.yml
+  -  storage.yml
+  -  rbac.yml
+  -  wp-mysql.yml
+------------------------------------------------------------------
+Save the above yml code with name "kustomization.yml" (without quotation mark).
+
+> kubectl create -k
+The above command will launch the entire WordPress application.
+
+> kubectl get all
+This will prompt the info of all the running deployement.
+
+
+Congratulation!! Multi-tier architecture on public cloud Amazon Web Services (AWS) using EKS Service is created.
+
+
+We can use either DNS name or Load Balancer IP to reach out WordPress application.
+
+I have done this task with ASHU KUMAR
+
+I would like to thank Mr.Vimal Daga under whose guidance i have been able to do this task.
+Thank you Mr.Vimal Daga and LINUXWORLD INFORMATICS for the wonderful guidance and making me eligible to do this task.
